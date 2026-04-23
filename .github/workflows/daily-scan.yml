@@ -1,0 +1,194 @@
+name: Daily LinkedIn Scan
+
+on:
+  schedule:
+    # Daily at 04:00 IST (22:30 UTC the previous day). GitHub Actions cron
+    # runs in UTC; 22:30 UTC → 04:00 IST because IST is UTC+5:30.
+    #
+    # Note on scheduled workflow reliability: GitHub's scheduler is
+    # best-effort and can delay runs by 15-60min during peak load. We also
+    # add a safety-net 2nd trigger at 23:30 UTC (05:00 IST) so if the
+    # primary 22:30 UTC trigger is skipped/delayed, the backup catches up.
+    # The first step below (`dedup`) short-circuits the backup if the
+    # primary already succeeded today — without that guard, both crons
+    # fire and the user gets two emails (which actually happened on
+    # 2026-04-23 — a `concurrency` group alone only queues the duplicate,
+    # it doesn't skip it).
+    - cron: "30 22 * * *"
+    - cron: "30 23 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run mode (no email, no state update)"
+        required: false
+        default: "false"
+      diagnose:
+        description: "Run API health probes + verbose pipeline instead of normal scan"
+        required: false
+        default: "false"
+
+concurrency:
+  group: linkedin-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # Multi-source fan-out (LinkedIn posts + LinkedIn jobs + Naukri) across
+    # ~4 tracks can take 35-50 min of wall clock on the Apify side alone; the
+    # old 30-min ceiling was killing runs mid-scrape. 60 gives headroom for
+    # scrape + filter + JD extract + embed + rerank + deliver end-to-end.
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Backup-cron dedup: only the 23:30 UTC trigger runs this; the
+      # primary 22:30 UTC run has nothing to dedup against. If we find a
+      # successful scheduled run of THIS workflow created in the last 3
+      # hours, we mark `skip=true` and every downstream step no-ops.
+      # Without this, both crons complete and the user gets two emails.
+      - name: Skip backup cron if primary already succeeded today
+        id: dedup
+        if: github.event.schedule == '30 23 * * *'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SINCE=$(date -u -d "3 hours ago" +%Y-%m-%dT%H:%M:%SZ)
+          # Filter: this workflow, scheduled event, succeeded, in last 3h,
+          # excluding the current run (--event filter doesn't exclude the
+          # in-flight one, so we also drop by databaseId).
+          RECENT=$(gh run list \
+            --workflow=daily-scan.yml \
+            --event=schedule \
+            --status=success \
+            --created=">=$SINCE" \
+            --limit=5 \
+            --json=databaseId,createdAt \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+          if [ "${RECENT:-0}" -gt 0 ]; then
+            echo "Primary run already succeeded in last 3h — skipping backup."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No successful primary run found — backup will proceed."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.dedup.outputs.skip != 'true'
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.dedup.outputs.skip != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Materialize role_preferences.json from secret
+        if: steps.dedup.outputs.skip != 'true'
+        env:
+          ROLE_PREFERENCES_JSON: ${{ secrets.ROLE_PREFERENCES_JSON }}
+        run: |
+          mkdir -p config
+          if [ -z "$ROLE_PREFERENCES_JSON" ]; then
+            echo "::error::ROLE_PREFERENCES_JSON secret is empty. See config/role_preferences.example.json for the expected shape, then: gh secret set ROLE_PREFERENCES_JSON < config/role_preferences.json"
+            exit 1
+          fi
+          printf '%s' "$ROLE_PREFERENCES_JSON" > config/role_preferences.json
+          # Strip any leading UTF-8 BOM (PowerShell's `Get-Content -Raw | gh secret set` injects one on Windows)
+          sed -i '1s/^\xEF\xBB\xBF//' config/role_preferences.json
+          python -c "import json,sys; d=json.load(open('config/role_preferences.json', encoding='utf-8-sig')); assert 'tracks' in d and isinstance(d['tracks'], list) and d['tracks'], 'tracks must be a non-empty list'; print('ok:', len(d['tracks']), 'tracks loaded')"
+
+      - name: Run scan
+        if: steps.dedup.outputs.skip != 'true'
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+          DELIVERY_METHOD: ${{ vars.DELIVERY_METHOD || 'resend' }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # Daily cadence → only look back 24h so the funnel is fresh; raise
+          # if you're seeing empty digests.
+          POSTED_LIMIT_DAYS: ${{ vars.POSTED_LIMIT_DAYS || '2' }}
+          # Multi-source fan-out knobs. Override via repo Variables (Settings
+          # → Secrets and variables → Actions → Variables tab) without editing
+          # this file. Defaults match config.py.
+          ENABLED_SOURCES: ${{ vars.ENABLED_SOURCES || 'linkedin_posts,linkedin_jobs,naukri_jobs' }}
+          MAX_POSTS_PER_QUERY: ${{ vars.MAX_POSTS_PER_QUERY || '200' }}
+          QUERIES_PER_TRACK: ${{ vars.QUERIES_PER_TRACK || '10' }}
+          MAX_LINKEDIN_JOBS_PER_TRACK: ${{ vars.MAX_LINKEDIN_JOBS_PER_TRACK || '500' }}
+          MAX_NAUKRI_JOBS_PER_TRACK: ${{ vars.MAX_NAUKRI_JOBS_PER_TRACK || '500' }}
+          ROLES_PER_JOB_BOARD_TRACK: ${{ vars.ROLES_PER_JOB_BOARD_TRACK || '4' }}
+          SIMILARITY_THRESHOLD: ${{ vars.SIMILARITY_THRESHOLD || '0.62' }}
+          LLM_RERANK_TOP_N: ${{ vars.LLM_RERANK_TOP_N || '30' }}
+          LLM_SCORE_THRESHOLD: ${{ vars.LLM_SCORE_THRESHOLD || '6.5' }}
+          # Soft deadline for the scrape stage. The pipeline gracefully
+          # stops starting new tracks once this elapses and passes whatever
+          # was collected down to filter/match/rerank/deliver — so a slow
+          # Apify day still produces an email instead of hitting the hard
+          # `timeout-minutes` ceiling below and losing everything. Keep
+          # this ≈20min under timeout-minutes × 60 so the downstream stages
+          # always have room to run.
+          SCRAPE_SOFT_DEADLINE_SECONDS: ${{ vars.SCRAPE_SOFT_DEADLINE_SECONDS || '2400' }}
+        run: |
+          if [ "${{ github.event.inputs.diagnose }}" = "true" ]; then
+            python -m src diagnose
+          elif [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python -m src dry-run
+          else
+            python -m src run
+          fi
+
+      - name: Commit tracking state & logs
+        if: steps.dedup.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage each path individually. `git add a b c` aborts with exit 128
+          # on the first missing pathspec and stages nothing else — which
+          # previously caused the whole state block (seen_posts.json,
+          # resume_embedding_cache.json, etc.) to silently NOT be committed
+          # whenever results/*.log or delivery_error_*.txt hadn't been written.
+          # Per-file `|| true` isolates each failure.
+          for p in \
+            config/seen_posts.json \
+            config/applied_posts.json \
+            config/rejected_posts.json \
+            config/resume_embedding_cache.json; do
+            [ -f "$p" ] && git add "$p" || true
+          done
+          # Globs: enable nullglob so unmatched patterns expand to nothing
+          # instead of being passed to git add literally.
+          shopt -s nullglob
+          for f in results/*.log results/delivery_error_*.txt; do
+            git add "$f" || true
+          done
+          shopt -u nullglob
+          if git diff --cached --quiet; then
+            echo "No new state to commit."
+          else
+            git commit -m "daily scan · $(date -u +%Y-%m-%d)"
+            # The workflow runs for 30-50 min. If a developer (or a parallel
+            # dispatch) pushes to main during that window, the vanilla `git
+            # push` fails with `[rejected] main -> main (fetch first)` and the
+            # whole job is marked failed even though the scan + email delivery
+            # already succeeded. Rebase-on-remote + retry absorbs those races.
+            for attempt in 1 2 3; do
+              if git pull --rebase origin main && git push; then
+                echo "State pushed on attempt $attempt."
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::warning::Failed to push state after 3 attempts. Email already delivered; state will refresh on next run."
+                exit 0
+              fi
+              echo "Push attempt $attempt failed. Retrying..."
+              sleep 5
+            done
+          fi

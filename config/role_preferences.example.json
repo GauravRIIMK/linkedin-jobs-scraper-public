@@ -1,0 +1,42 @@
+{
+  "tracks": [
+    {
+      "track": "growth_marketing",
+      "active": true,
+      "roles": [
+        "Growth Marketer",
+        "Growth Marketing Manager",
+        "Performance Marketing Lead",
+        "Head of Growth"
+      ],
+      "cities": ["Bangalore", "Bengaluru"],
+      "include_remote": true,
+      "resume_summary": "Growth marketer with 6+ years across SaaS / Fintech / PLG products. Skills: SEO, paid acquisition (Google/Meta/LinkedIn ads), lifecycle & retention, funnel experimentation, analytics (Mixpanel, Amplitude, GA4). Past roles at [company A], [company B]."
+    },
+    {
+      "track": "product_ai",
+      "active": true,
+      "roles": [
+        "AI Product Manager",
+        "Product Manager - AI/ML",
+        "Senior Product Manager",
+        "Principal Product Manager"
+      ],
+      "cities": ["Bangalore", "Bengaluru"],
+      "include_remote": true,
+      "resume_summary": "Product manager with 6+ years; ML / AI strategy, LLM apps, experimentation. Shipped [example feature]. Strong in user research, roadmapping, cross-functional leadership, data-informed decisions."
+    },
+    {
+      "track": "strategy_ops",
+      "active": false,
+      "roles": [
+        "Strategy & Operations Lead",
+        "Chief of Staff",
+        "BizOps Manager"
+      ],
+      "cities": ["Bangalore", "Bengaluru"],
+      "include_remote": true,
+      "resume_summary": "Strategy & ops generalist with 6+ years; market analysis, GTM planning, cross-functional project delivery, financial modeling."
+    }
+  ]
+}

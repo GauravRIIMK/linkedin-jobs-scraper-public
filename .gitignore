@@ -1,0 +1,53 @@
+# ---------- Secrets ----------
+.env
+.env.local
+
+# ---------- Private inputs ----------
+# Resume PDFs — stay on your machine, never committed.
+resume/*.pdf
+resume/*.docx
+!resume/.gitkeep
+
+# Your real role preferences; the example template IS tracked.
+config/role_preferences.json
+!config/role_preferences.example.json
+config/resume_profile_*.json
+
+# ---------- Runtime state (private per user) ----------
+# These files accumulate URLs and vectors from your actual scrapes.
+# If you fork + run this in a public repo, keep them ignored. If you fork
+# into a PRIVATE repo and want state to persist across CI runs, delete
+# these four lines so the cron can commit them back.
+config/seen_posts.json
+config/applied_posts.json
+config/rejected_posts.json
+config/resume_embedding_cache.json
+
+# ---------- Run artifacts ----------
+results/*.md
+results/*.csv
+results/*.log
+results/*.txt
+!results/.gitkeep
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ---------- Local agent / scratch ----------
+.claude/
+.tmp/
