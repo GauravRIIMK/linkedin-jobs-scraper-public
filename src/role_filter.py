@@ -115,6 +115,21 @@ TRACK_NEGATIVES: dict[str, list[str]] = {
         "principal engineer",
         "staff engineer",
         "distinguished engineer",
+        # ------------------------------------------------------------------
+        # Non-technical admin / support archetype. Surface tokens like
+        # "operations", "assistant", "office" collide with the ai-operator /
+        # chief-of-staff archetype the user wants, but the underlying role
+        # families are fundamentally different — an Executive Assistant is
+        # calendar + travel, not tool-builder + workflow-automator. Drop.
+        # ------------------------------------------------------------------
+        "executive assistant",
+        "admin assistant",
+        "administrative assistant",
+        "office manager",
+        "office administrator",
+        "receptionist",
+        "customer support",
+        "customer service",
     ],
     # ----------------------------------------------------------------
     # Marketing track: user has NO experience in digital marketing or
@@ -176,6 +191,20 @@ TRACK_NEGATIVES: dict[str, list[str]] = {
         "ad operations",
         "ad ops",
         "adwords specialist",
+        # ------------------------------------------------------------------
+        # SWE-adjacent titles that use go-to-market lexicon but are actually
+        # software engineering roles (build in-house GTM tooling, internal
+        # revenue-ops platforms, customer-facing automation at AI companies).
+        # These posts kept leaking into growth_marketing digests because the
+        # words "growth" / "revenue" / "GTM" overlap with the track's
+        # resume_summary lexicon, even though the candidate profile is
+        # growth-marketing (not engineer).
+        # ------------------------------------------------------------------
+        "gtm engineer",
+        "growth engineer",
+        "revenue engineer",
+        "forward deployed engineer",
+        "forward-deployed engineer",
     ],
 }
 
@@ -393,6 +422,56 @@ def filter_by_role(
     track: str,
     posts: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
-    """Return (kept, rejected_count). Order preserved within kept."""
+    """Return (kept, rejected_count). Order preserved within kept.
+
+    HARD-DROP variant. Kept for backward compatibility — the pipeline now
+    prefers `tag_by_role` (soft mode: tag off-archetype posts without
+    dropping so downstream stages can still analyze them).
+    """
     kept = [p for p in posts if passes_role_filter(track, p)]
     return kept, len(posts) - len(kept)
+
+
+def role_filter_verdict(track: str, post: dict[str, Any]) -> str:
+    """Non-dropping variant of `passes_role_filter`.
+
+    Returns one of:
+        "pass"          — post clears the role-archetype gate
+        "off_archetype" — post matches a negative with no positive rescue
+
+    This is the entry point used when role-filter runs in soft mode:
+    downstream consumers (priority_ranker) apply PRIORITY_PENALTY_OFF_ARCHETYPE
+    to the Haiku score for off-archetype posts, so those posts still reach
+    the reranker + boost stack but need an unusually strong signal stack
+    to clear the final threshold.
+
+    Rationale: the previous hard-drop behavior silently killed posts whose
+    TITLE looked off-archetype but whose BODY was a genuine fit (e.g. an
+    "Automation Specialist / Executive Assistant hybrid" at a Tier-1 company
+    where the EA framing was the published title but the actual work was
+    chief-of-staff-style operator). Soft mode lets the reranker+boost see
+    them, and the off-archetype penalty ensures they still need to earn
+    their inbox slot.
+    """
+    return "pass" if passes_role_filter(track, post) else "off_archetype"
+
+
+def tag_by_role(
+    track: str,
+    posts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Tag each post with `role_filter_verdict` without dropping any.
+
+    Returns (tagged_posts, off_archetype_count). Posts are returned in the
+    original order with a new `role_filter_verdict` key set to "pass" or
+    "off_archetype". Priority ranker reads this tag and applies the
+    off-archetype penalty downstream.
+    """
+    tagged: list[dict[str, Any]] = []
+    off_count = 0
+    for p in posts:
+        verdict = role_filter_verdict(track, p)
+        if verdict == "off_archetype":
+            off_count += 1
+        tagged.append({**p, "role_filter_verdict": verdict})
+    return tagged, off_count

@@ -98,9 +98,14 @@ def run_pipeline(dry_run: bool = False) -> dict[str, Any]:
     #    (d) YoE filter: reject JDs asking for significantly more YoE than
     #        the user has. Prevents "10+ years required" roles from wasting
     #        Voyage/Haiku API spend downstream.
-    #    (e) Role-archetype filter: per-track negative-keyword gate. Only
-    #        ai_ops_automation currently uses it (user is vibecoder, not
-    #        SWE/ML engineer). Extend role_filter.TRACK_NEGATIVES as needed.
+    #    (e) Role-archetype TAG (soft mode, not drop): each post gets a
+    #        `role_filter_verdict` of "pass" or "off_archetype". Off-archetype
+    #        posts still flow through embedding + Haiku + boosts — they just
+    #        carry a configurable penalty (config.PRIORITY_PENALTY_OFF_ARCHETYPE)
+    #        at the priority-ranker stage. This honors the user's directive
+    #        that all leads get analyzed; only posts with weak fit AND weak
+    #        boosts end up filtered by the final threshold.
+    #        Extend role_filter.TRACK_NEGATIVES as new archetype drift shows up.
     filtered_by_track: dict[str, list[dict[str, Any]]] = {}
     for track, posts in posts_by_track.items():
         with_apply = application_filter.filter_posts_with_apply_method(posts)
@@ -109,14 +114,15 @@ def run_pipeline(dry_run: bool = False) -> dict[str, Any]:
         enriched = [{**p, **jd_extractor.extract_jd(p)} for p in with_apply]
         fresh = tracking.drop_known(enriched)
         yoe_kept, yoe_dropped = experience_filter.filter_by_yoe(fresh)
-        role_kept, role_dropped = role_filter.filter_by_role(track, yoe_kept)
-        filtered_by_track[track] = role_kept
+        role_tagged, off_archetype_count = role_filter.tag_by_role(track, yoe_kept)
+        filtered_by_track[track] = role_tagged
         _log(
             log,
             f"  {track}: {len(with_apply)} apply ({dist_str}) · "
             f"{len(fresh)} unseen · "
             f"{len(yoe_kept)} under-YoE-cap (-{yoe_dropped}) · "
-            f"{len(role_kept)} role-fit (-{role_dropped})",
+            f"{len(role_tagged)} retained "
+            f"({off_archetype_count} off-archetype tagged, not dropped)",
         )
 
     # 3. Match — Voyage embedding similarity per track
@@ -197,6 +203,25 @@ def run_pipeline(dry_run: bool = False) -> dict[str, Any]:
             f"({n_boosted_kept} boosted, {n_lifted_by_boost} lifted over line by boost)",
         )
 
+    # 5b. Per-track (company, title) dedup — collapses the
+    #     "5× DevcommX GTM Engineer" pattern where the same role is posted
+    #     multiple times by resharers or syndicated across sources under
+    #     the same track. Runs AFTER boost so the keeper is chosen by
+    #     FINAL score (a LinkedIn post with a Tier-1 Indian boost should
+    #     beat a Naukri listing of the same role).
+    if config.PER_TRACK_COMPANY_CAP > 0:
+        before = sum(len(v) for v in boosted_by_track.values())
+        boosted_by_track, cap_dropped = _per_track_company_title_cap(
+            boosted_by_track, config.PER_TRACK_COMPANY_CAP
+        )
+        after = sum(len(v) for v in boosted_by_track.values())
+        if cap_dropped:
+            _log(
+                log,
+                f"Per-track company/title cap dropped {cap_dropped} post(s) "
+                f"({before} → {after}).",
+            )
+
     # 6. Cross-track dedup: a post that appeared in multiple tracks → assign best-fit
     final = _assign_unique_track(boosted_by_track, prefs, log)
 
@@ -241,6 +266,84 @@ def run_pipeline(dry_run: bool = False) -> dict[str, Any]:
 
     _save_log(log)
     return {"matches": final, "log": log, "delivery": delivery_info}
+
+
+# ------------------------------ Per-track cap ------------------------------
+#
+# Within a single track, the same role is often posted multiple times (same
+# company + same title, different URLs because of:
+#   • The hiring team + 2-3 ICs all reshare the original hiring post
+#   • LinkedIn Jobs + Naukri syndicate the same listing
+#   • Different recruiters at the same company post the same opening
+#
+# The cross-track content-dedup stage only catches cross-track duplicates
+# (the same role appearing in BOTH growth_marketing AND strategy_consulting).
+# This cap runs BEFORE that stage and catches same-track duplicates, keeping
+# the top-N (default 1) by final boosted score. Source tie-break mirrors the
+# cross-track dedup: linkedin_post > linkedin_job > naukri.
+
+
+def _per_track_company_title_cap(
+    boosted_by_track: dict[str, list[dict[str, Any]]],
+    cap: int,
+) -> tuple[dict[str, list[dict[str, Any]]], int]:
+    """For each track, collapse posts with the same (company, title) signature.
+
+    Uses the same normalization as the cross-track dedup
+    (`_normalize_company_for_dedup` / `_normalize_title_for_dedup`) so the
+    two stages see identical clusters. Posts with empty company AND empty
+    title are left untouched (key too broad to trust).
+
+    Keeps the top `cap` posts per cluster ranked by:
+        (llm_score desc, source_preference desc)
+
+    Returns (deduped_by_track, total_dropped_count).
+    """
+    if cap <= 0:
+        return boosted_by_track, 0
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    dropped_total = 0
+    for track, posts in boosted_by_track.items():
+        clusters: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        untouched: list[dict[str, Any]] = []
+        for p in posts:
+            # Prefer structured fields; fall back to author-headline parsing
+            # (priority_ranker._extract_author_company) when the source
+            # doesn't populate `company` directly.
+            raw_company = (
+                p.get("company")
+                or p.get("company_name")
+                or priority_ranker._extract_author_company(p)
+                or ""
+            )
+            company = _normalize_company_for_dedup(raw_company)
+            title = _normalize_title_for_dedup(p.get("title") or "")
+            if not company and not title:
+                untouched.append(p)
+                continue
+            clusters.setdefault((company, title), []).append(p)
+
+        kept: list[dict[str, Any]] = list(untouched)
+        for entries in clusters.values():
+            if len(entries) <= cap:
+                kept.extend(entries)
+                continue
+            # Highest score wins; source preference is the tiebreaker (same
+            # ordering as the cross-track content-dedup stage).
+            entries.sort(
+                key=lambda e: (
+                    float(e.get("llm_score", 0.0)),
+                    _SOURCE_PREFERENCE.get(e.get("source") or "", 0),
+                ),
+                reverse=True,
+            )
+            kept.extend(entries[:cap])
+            dropped_total += len(entries) - cap
+
+        kept.sort(key=lambda p: p.get("llm_score", 0.0), reverse=True)
+        out[track] = kept
+    return out, dropped_total
 
 
 def _assign_unique_track(

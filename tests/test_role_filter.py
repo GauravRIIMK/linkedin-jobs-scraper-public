@@ -305,3 +305,142 @@ def test_matches_across_hyphenation():
     assert not role_filter.passes_role_filter("ai_ops_automation", _post("Full-Stack Developer"))
     assert not role_filter.passes_role_filter("ai_ops_automation", _post("Full Stack Developer"))
     assert not role_filter.passes_role_filter("ai_ops_automation", _post("Fullstack-Developer"))
+
+
+# ---------------------------- Hardening: new negatives ----------------------------
+# Extended after observing these title families leaking through into the daily
+# digest — see RUNBOOK §6 ("filter tuning") for the symptom → fix pattern.
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # SWE-adjacent titles that use GTM / growth lexicon but are coder roles.
+        # Kept leaking into growth_marketing via token overlap with the resume
+        # summary ("growth", "revenue", "go-to-market").
+        "GTM Engineer",
+        "Gtm engineer",
+        "GTM-Engineer",
+        "Growth Engineer",
+        "Revenue Engineer",
+        "Forward Deployed Engineer",
+        "Forward-Deployed Engineer",
+        "Senior Forward Deployed Engineer",
+    ],
+)
+def test_rejects_gtm_engineer_family_for_growth_marketing(title):
+    """GTM Engineer / Growth Engineer / Forward-Deployed Engineer titles are
+    SWE-adjacent and should NOT reach the growth_marketing digest."""
+    assert not role_filter.passes_role_filter("growth_marketing", _post(title))
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # Non-technical admin / support titles that leaked into ai_ops_automation
+        # via surface-token overlap on "operations" and "automation".
+        "Executive Assistant",
+        "Executive Assistant to CEO",
+        "Admin Assistant",
+        "Administrative Assistant",
+        "Office Manager",
+        "Office Administrator",
+        "Receptionist",
+        "Customer Support Executive",
+        "Customer Support Representative",
+        "Customer Service Associate",
+    ],
+)
+def test_rejects_admin_support_titles_for_ai_ops_automation(title):
+    """EA / admin / office-manager / support titles are NOT the ai-operator
+    archetype the user actually wants."""
+    assert not role_filter.passes_role_filter("ai_ops_automation", _post(title))
+
+
+def test_office_manager_does_not_match_operations_manager():
+    """Word boundaries keep 'office manager' and 'operations manager' distinct.
+    'Operations Manager' should PASS for ai_ops_automation (no negative hit)."""
+    assert role_filter.passes_role_filter("ai_ops_automation", _post("Operations Manager"))
+    assert role_filter.passes_role_filter("ai_ops_automation", _post("Senior Operations Manager"))
+
+
+def test_customer_support_rescued_by_automation_positive():
+    """A hybrid 'AI Customer Support Automation Lead' role hits the
+    'customer support' negative but is rescued by 'automation lead' positive —
+    a legitimate ai-operator archetype that happens to apply automation to
+    the support workflow."""
+    post = _post("AI Customer Support — Automation Lead")
+    assert role_filter.passes_role_filter("ai_ops_automation", post)
+
+
+def test_growth_engineer_not_rescued_by_generic_growth_positive():
+    """Title 'Growth Engineer' hits the new negative. When the body is
+    engineering-flavored (no growth/brand/content/product-marketing phrase),
+    no positive fires — the negative stands and the post is rejected."""
+    post = _post(
+        "Growth Engineer",
+        "Build data pipelines, experimentation infra, and A/B testing tools.",
+    )
+    assert not role_filter.passes_role_filter("growth_marketing", post)
+
+
+# ---------------------------- role_filter_verdict / tag_by_role ----------------------------
+# Soft-mode variant: tag off-archetype posts instead of dropping them, so
+# priority_ranker can apply PRIORITY_PENALTY_OFF_ARCHETYPE downstream.
+
+def test_role_filter_verdict_pass():
+    assert role_filter.role_filter_verdict(
+        "ai_ops_automation", _post("AI Product Manager")
+    ) == "pass"
+
+
+def test_role_filter_verdict_off_archetype():
+    assert role_filter.role_filter_verdict(
+        "ai_ops_automation", _post("Senior Software Engineer")
+    ) == "off_archetype"
+
+
+def test_role_filter_verdict_rescued_by_positive_is_pass():
+    """Positive rescues flip the verdict back to 'pass'."""
+    post = _post("Automation Specialist - Python Developer scripting needed")
+    assert role_filter.role_filter_verdict("ai_ops_automation", post) == "pass"
+
+
+def test_tag_by_role_preserves_all_posts():
+    """Soft-mode tagging drops NOTHING — every input post comes back out,
+    just with a role_filter_verdict tag attached."""
+    posts = [
+        _post("AI Product Manager"),
+        _post("Senior Software Engineer"),
+        _post("Chief of Staff"),
+        _post("Executive Assistant"),
+    ]
+    tagged, off_count = role_filter.tag_by_role("ai_ops_automation", posts)
+    assert len(tagged) == len(posts)
+    assert off_count == 2  # SWE + EA are off-archetype
+    verdicts = [p["role_filter_verdict"] for p in tagged]
+    assert verdicts == ["pass", "off_archetype", "pass", "off_archetype"]
+
+
+def test_tag_by_role_does_not_mutate_input_posts():
+    """tag_by_role returns new dicts; the original posts must be untouched
+    so callers can still use the pre-tag version (e.g. for logging)."""
+    original = _post("Senior Software Engineer")
+    tagged, _ = role_filter.tag_by_role("ai_ops_automation", [original])
+    assert "role_filter_verdict" not in original
+    assert tagged[0]["role_filter_verdict"] == "off_archetype"
+
+
+def test_tag_by_role_empty_list():
+    tagged, off_count = role_filter.tag_by_role("ai_ops_automation", [])
+    assert tagged == []
+    assert off_count == 0
+
+
+def test_tag_by_role_unknown_track_tags_all_pass():
+    """Tracks without negatives (strategy_consulting, product_brand_category,
+    unknown_track) should tag every post as 'pass' — no archetype rule to
+    flag against."""
+    posts = [_post("ML Engineer"), _post("Data Scientist")]
+    tagged, off_count = role_filter.tag_by_role("strategy_consulting", posts)
+    assert off_count == 0
+    assert all(p["role_filter_verdict"] == "pass" for p in tagged)

@@ -94,9 +94,16 @@ LLM_RERANK_TOP_N = int(os.getenv("LLM_RERANK_TOP_N", "30"))
 # Apply listings every run and the user's explicit priority — LinkedIn
 # posts with recruiter-style hiring language — never reached the LLM.
 LLM_RERANK_MIN_LINKEDIN_POSTS = int(os.getenv("LLM_RERANK_MIN_LINKEDIN_POSTS", "15"))
-# Lowered from 7.0 → 6.5: with a 7-day window and broader apply-method catchment,
-# we want borderline-fit posts surfaced rather than silently dropped.
-LLM_SCORE_THRESHOLD = float(os.getenv("LLM_SCORE_THRESHOLD", "6.5"))
+# Raised 6.5 → 7.0 after observing too many borderline-fit posts reaching
+# inbox via boost-lift alone (e.g. Haiku 5.8 + Tier-1 + India = 7.0 exactly,
+# the post itself still a stretch). Tightening the bar works now that two
+# other safeguards catch under-surfaced signal:
+#   • Soft role-filter: off-archetype posts flow through but get penalized
+#     (see PRIORITY_PENALTY_OFF_ARCHETYPE) rather than being dropped, so
+#     legitimate outliers can still reach the inbox when other signals stack.
+#   • Per-track (company, title) dedup collapses 5× DevcommX GTM Engineer
+#     into 1, so inbox slots aren't being wasted on same-role duplicates.
+LLM_SCORE_THRESHOLD = float(os.getenv("LLM_SCORE_THRESHOLD", "7.0"))
 
 # ---------- Dedup / recency ----------
 # Rolling window (in days) during which a delivered post is suppressed from
@@ -161,6 +168,21 @@ PRIORITY_BOOST_INDIA = float(os.getenv("PRIORITY_BOOST_INDIA", "0.4"))
 # not everything-else banned.
 PRIORITY_PENALTY_NON_INDIA = float(os.getenv("PRIORITY_PENALTY_NON_INDIA", "0.6"))
 
+# ---------- Off-archetype penalty (post-rerank) ----------
+# The role_filter stage tags each post with role_filter_verdict == "pass"
+# or "off_archetype" instead of dropping off-archetype posts. The penalty
+# fires here so off-archetype posts still flow through every stage — and
+# if one is genuinely a strong fit (e.g. a Tier-1 Indian company + recruiter-
+# dropped link + 1st-degree connection), the stacked boosts can still lift
+# it past the threshold. Tuned at 1.2 so a single boost alone can't rescue
+# an off-archetype post, but a 2-3 signal stack can.
+#
+# This is the mechanism by which "all leads flow through the pipeline and
+# get analyzed" (user spec) without flooding the inbox with off-archetype
+# noise. Raise to 2.0 if off-archetype posts still leak through; lower to
+# 0.8 if genuinely-interesting outliers are being suppressed.
+PRIORITY_PENALTY_OFF_ARCHETYPE = float(os.getenv("PRIORITY_PENALTY_OFF_ARCHETYPE", "1.2"))
+
 # ---------- Network-degree boosts ----------
 # Fire when the post author is in the user's LinkedIn connections export.
 # HarvestAPI cannot expose the querying account's network (it scrapes via its
@@ -208,6 +230,17 @@ ENABLE_SOFT_APPLY = os.getenv("ENABLE_SOFT_APPLY", "true").lower() == "true"
 # them using (company, normalized_title, location) as a fuzzy key. Keeps
 # the highest-scored instance.
 ENABLE_CONTENT_DEDUP = os.getenv("ENABLE_CONTENT_DEDUP", "true").lower() == "true"
+
+# Per-track cap: max posts with the SAME (normalized_company, normalized_title)
+# signature allowed inside a single track's final list. Collapses the
+# "5× DevcommX GTM Engineer" pattern (same company, same role, different
+# post URLs from resharers or cross-source syndication) to a single
+# representative before cross-track dedup runs. Keeps the highest-scored
+# instance; ties broken by source preference (linkedin_post > linkedin_job
+# > naukri). Set to 0 to disable the per-track cap (the cross-track content
+# dedup in pipeline._content_dedup_across_tracks still fires — orthogonal
+# layer that catches same-role-different-tracks duplicates).
+PER_TRACK_COMPANY_CAP = int(os.getenv("PER_TRACK_COMPANY_CAP", "1"))
 
 # Home cities for the user-city boost. Comma-separated, lowercased, matched
 # as case-insensitive substring against the post's structured location field.

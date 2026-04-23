@@ -173,19 +173,63 @@ _BADGE_COLORS: dict[str, tuple[str, str]] = {
     # Geolocation badges — the user prioritizes India hires.
     "India":                     ("#fff1f2", "#9f1239"),   # soft rose — "country match"
     "Not in India":              ("#f1f5f9", "#475569"),   # muted gray — "deprioritized"
+    # Archetype-mismatch warning chip. Red-ish so the user sees the trade-off
+    # at a glance: "this post is off-archetype but other signals lifted it
+    # past the threshold anyway".
+    "Off-archetype":             ("#fef2f2", "#991b1b"),   # light red — "warning"
 }
 
 
-def _render_badges(reasons: list[str]) -> str:
+def _format_magnitude(mag: float) -> str:
+    """Format a signed boost/penalty for display inside a chip.
+
+    Convention: always show the sign (`+0.4`, `-1.2`) so users can
+    distinguish boosts from penalties at a glance. Round to 1 decimal —
+    tighter precision would just add visual noise without improving
+    interpretability.
+    """
+    if mag > 0:
+        return f" +{mag:.1f}"
+    if mag < 0:
+        return f" {mag:.1f}"
+    return ""
+
+
+def _render_badges(reasons: list) -> str:
+    """Render a row of colored chips for the priority reasons.
+
+    Accepts either:
+      - list[str]                       — legacy shape, label-only chips
+      - list[tuple[str, float]]         — detailed shape, chip shows
+                                          `Label ±X.X` to expose the
+                                          boost/penalty magnitude
+
+    Both shapes are supported so the email renders correctly even if an
+    older CSV is replayed (priority_reasons list[str]) or an upgraded
+    priority_ranker emits detailed tuples.
+    """
     if not reasons:
         return ""
     chips: list[str] = []
     for r in reasons:
-        bg, fg = _BADGE_COLORS.get(r, ("#f4f4f4", "#555"))
+        if isinstance(r, (tuple, list)) and len(r) == 2:
+            label_raw, magnitude_raw = r[0], r[1]
+            try:
+                magnitude = float(magnitude_raw)
+            except (TypeError, ValueError):
+                magnitude = 0.0
+            label = str(label_raw)
+            mag_str = _format_magnitude(magnitude)
+        else:
+            label = str(r)
+            mag_str = ""
+        bg, fg = _BADGE_COLORS.get(label, ("#f4f4f4", "#555"))
         chips.append(
             f'<span style="background:{bg};color:{fg};padding:2px 7px;'
             f'border-radius:10px;font-size:11px;margin-right:4px;'
-            f'white-space:nowrap;font-weight:600">{escape(r)}</span>'
+            f'white-space:nowrap;font-weight:600">'
+            f'{escape(label)}{escape(mag_str)}'
+            f'</span>'
         )
     return "".join(chips)
 
@@ -209,6 +253,7 @@ def build_html(matches_by_track: dict[str, list[dict[str, Any]]]) -> str:
             )
             reason = escape(m.get("llm_reason") or "")
             score = round(float(m.get("llm_score", 0.0)), 1)
+            base_score = round(float(m.get("base_llm_score", score)), 1)
             boost = float(m.get("priority_boost", 0.0))
             post_url = m.get("post_url") or "#"
             author = escape(m.get("author_name") or "Unknown")
@@ -221,15 +266,23 @@ def build_html(matches_by_track: dict[str, list[dict[str, Any]]]) -> str:
                 f'{escape(", ".join(_method_label(x) for x in methods))}</span>'
                 if methods else ""
             )
-            badges_html = _render_badges(m.get("priority_reasons") or [])
-            boost_html = (
-                f' <span style="opacity:0.8;font-weight:400">+{boost:.1f}</span>'
-                if boost > 0 else ""
+            # Prefer the detailed (label, magnitude) list — falls back to the
+            # legacy label-only list for posts rendered from older CSVs.
+            badges_html = _render_badges(
+                m.get("priority_reasons_detailed") or m.get("priority_reasons") or []
             )
+            # Score chip: show `base → final` when boost/penalty moved the
+            # score by ≥0.1, so the user sees how the final number came
+            # together (e.g. `5.8 → 7.0/10` makes it obvious the post
+            # cleared the bar via boosts rather than raw Haiku fit).
+            if abs(score - base_score) >= 0.1:
+                score_inner = f"{base_score:.1f} → {score:.1f}/10"
+            else:
+                score_inner = f"{score}/10"
             score_tag = (
                 f'<span style="background:#0a66c2;color:#fff;padding:2px 8px;'
                 f'border-radius:3px;font-weight:600;font-size:12px">'
-                f'{score}/10{boost_html}'
+                f'{score_inner}'
                 f'</span>'
             )
             rows.append(
@@ -288,6 +341,8 @@ def build_html(matches_by_track: dict[str, list[dict[str, Any]]]) -> str:
           <span style="background:#f3e8ff;color:#6b21a8;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:600">Apply in comments</span>
           <span style="background:#eaf1fb;color:#0a66c2;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:600">LinkedIn post</span>
           <span style="background:#e3f2fd;color:#0277bd;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:600">Near you</span>
+          <span style="background:#fef2f2;color:#991b1b;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:600">Off-archetype</span>
+          <span style="color:#999;font-weight:400">&nbsp;· Numbers (e.g. <code>India +0.4</code>) show each chip's contribution to the final score.</span>
         </p>
         {''.join(sections)}
         <hr style="border:none;border-top:1px solid #eee;margin:28px 0 12px 0">

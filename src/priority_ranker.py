@@ -754,7 +754,7 @@ def _is_second_degree_connection(post: dict[str, Any]) -> bool:
 
 
 def compute_priority_boost(post: dict[str, Any]) -> tuple[float, list[str]]:
-    """Return (total_boost, reason_labels).
+    """Return (total_boost, reason_labels) — label-only, backward-compatible.
 
     Labels are short human strings used for email badges. Multiple labels
     are possible (e.g. a LinkedIn post from a Tier-1 Indian company that's
@@ -763,13 +763,50 @@ def compute_priority_boost(post: dict[str, Any]) -> tuple[float, list[str]]:
     Signal stacking is intentional — a LinkedIn post where the recruiter
     themselves dropped the form in comments AND is tagged "Head of Talent"
     at a Tier-1 Indian company should visibly dominate the ranking.
+
+    For the numeric-magnitude variant (used by the email chip renderer),
+    see `compute_priority_boost_detailed`. This function is retained as-is
+    so external callers (and the ~30 tests that assert on its return shape)
+    don't break.
+    """
+    boost, detailed = compute_priority_boost_detailed(post)
+    return boost, [label for label, _ in detailed]
+
+
+def compute_priority_boost_detailed(
+    post: dict[str, Any],
+) -> tuple[float, list[tuple[str, float]]]:
+    """Return (total_boost, [(label, signed_magnitude), …]).
+
+    Each entry preserves its signed magnitude so downstream renderers
+    (delivery.build_html's chip row) can show the user exactly HOW a
+    post's final score was assembled — e.g. `[Tier-1 +1.0] [India +0.4]
+    [Off-archetype -1.2]`. The magnitude is the signed delta that each
+    signal contributed to `boost`; summing the magnitudes reconstructs
+    `boost` exactly.
+
+    Also applies the off-archetype penalty when `role_filter_verdict`
+    on the post is `"off_archetype"` (see role_filter.tag_by_role).
     """
     boost = 0.0
-    reasons: list[str] = []
+    reasons: list[tuple[str, float]] = []
+
+    # Off-archetype penalty — applied first so it's visually prominent in
+    # the chip row (users scanning the email see "Off-archetype" before
+    # the positives, making the trade-off clear at a glance).
+    #
+    # Fires only when the role_filter pipeline stage tagged the post as
+    # off_archetype. If the tag is missing (legacy callers, or a test
+    # that skips the tag step), we treat it as pass — safe default.
+    verdict = post.get("role_filter_verdict")
+    if verdict == "off_archetype" and config.PRIORITY_PENALTY_OFF_ARCHETYPE > 0:
+        magnitude = config.PRIORITY_PENALTY_OFF_ARCHETYPE
+        boost -= magnitude
+        reasons.append(("Off-archetype", -magnitude))
 
     if post.get("source") == "linkedin_post":
         boost += config.PRIORITY_BOOST_LINKEDIN_POST
-        reasons.append("LinkedIn post")
+        reasons.append(("LinkedIn post", config.PRIORITY_BOOST_LINKEDIN_POST))
 
     # Apply-link-in-comments: also check whether the comment came from the
     # post author (strongest recruiter pattern). We add BOTH boosts so an
@@ -777,14 +814,14 @@ def compute_priority_boost(post: dict[str, Any]) -> tuple[float, list[str]]:
     in_any_comment, from_op = _apply_link_in_comments(post)
     if in_any_comment:
         boost += config.PRIORITY_BOOST_APPLY_IN_COMMENTS
-        reasons.append("Apply in comments")
+        reasons.append(("Apply in comments", config.PRIORITY_BOOST_APPLY_IN_COMMENTS))
     if from_op:
         boost += config.PRIORITY_BOOST_APPLY_FROM_OP
-        reasons.append("Recruiter-dropped link")
+        reasons.append(("Recruiter-dropped link", config.PRIORITY_BOOST_APPLY_FROM_OP))
 
     if is_hiring_intent_author(post):
         boost += config.PRIORITY_BOOST_HIRING_INTENT
-        reasons.append("Hiring manager / recruiter")
+        reasons.append(("Hiring manager / recruiter", config.PRIORITY_BOOST_HIRING_INTENT))
 
     # Body-language signal: fires when the POST TEXT itself reads like a
     # recruiter's / team-lead's hiring post (vs. a reshare or a generic
@@ -792,45 +829,45 @@ def compute_priority_boost(post: dict[str, Any]) -> tuple[float, list[str]]:
     # matching = high-confidence recruiter drop.
     if has_recruiter_language(post):
         boost += config.PRIORITY_BOOST_RECRUITER_LANGUAGE
-        reasons.append("Recruiter-style post")
+        reasons.append(("Recruiter-style post", config.PRIORITY_BOOST_RECRUITER_LANGUAGE))
 
     # Connection-degree signals. 1st-degree short-circuits 2nd (no
     # double-counting); both are LinkedIn-posts-only via inner guards.
     is_1st = _is_first_degree_connection(post)
     if is_1st:
         boost += config.PRIORITY_BOOST_CONNECTION_1ST
-        reasons.append("1st connection")
+        reasons.append(("1st connection", config.PRIORITY_BOOST_CONNECTION_1ST))
     elif _is_second_degree_connection(post):
         boost += config.PRIORITY_BOOST_CONNECTION_2ND
-        reasons.append("2nd connection")
+        reasons.append(("2nd connection", config.PRIORITY_BOOST_CONNECTION_2ND))
 
     indian_tier1 = _is_indian_tier1(post)
     if indian_tier1:
         boost += config.PRIORITY_BOOST_INDIAN_TIER1
-        reasons.append("Tier-1 Indian company")
+        reasons.append(("Tier-1 Indian company", config.PRIORITY_BOOST_INDIAN_TIER1))
 
     if _is_remote(post):
         boost += config.PRIORITY_BOOST_REMOTE
-        reasons.append("Remote")
+        reasons.append(("Remote", config.PRIORITY_BOOST_REMOTE))
 
     user_city = _is_user_city(post)
     if user_city:
         boost += config.PRIORITY_BOOST_USER_CITY
-        reasons.append("Near you")
+        reasons.append(("Near you", config.PRIORITY_BOOST_USER_CITY))
 
     # India-location: only fire when neither of the two stronger Indian
     # signals already did — otherwise we'd stack +1.0 (tier1) + +0.3 (city)
     # + +0.4 (india) on the same physical cue.
     if not indian_tier1 and not user_city and _is_india_located(post):
         boost += config.PRIORITY_BOOST_INDIA
-        reasons.append("India")
+        reasons.append(("India", config.PRIORITY_BOOST_INDIA))
     # Non-India penalty: structured location names a non-India region and
     # no India signal fires. Subtract a small amount so Indian roles
     # dominate even when the fit score is comparable. Guarded by the
     # configured magnitude so setting it to 0 disables the penalty cleanly.
     elif config.PRIORITY_PENALTY_NON_INDIA > 0 and _is_non_india_located(post):
         boost -= config.PRIORITY_PENALTY_NON_INDIA
-        reasons.append("Not in India")
+        reasons.append(("Not in India", -config.PRIORITY_PENALTY_NON_INDIA))
 
     return boost, reasons
 
@@ -840,14 +877,19 @@ def apply_priority_boosts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     store the base/boost/reasons for transparency, then re-sort desc.
 
     Adds these keys to each post:
-      - base_llm_score (float)    — pre-boost Haiku score
-      - priority_boost (float)    — total boost applied
-      - priority_reasons (list)   — badge labels for email rendering
-      - llm_score (float)         — post-boost score (clamped to 10)
+      - base_llm_score (float)              — pre-boost Haiku score
+      - priority_boost (float)              — total signed boost applied
+      - priority_reasons (list[str])        — badge labels (backward-compat)
+      - priority_reasons_detailed (list[(str, float)])
+                                            — badge labels + signed magnitude
+                                              (used by the email chip renderer
+                                              to show `[India +0.4]` style
+                                              transparency)
+      - llm_score (float)                   — post-boost score (clamped 0..10)
     """
     out: list[dict[str, Any]] = []
     for p in posts:
-        boost, reasons = compute_priority_boost(p)
+        boost, detailed = compute_priority_boost_detailed(p)
         base = float(p.get("llm_score", 0.0))
         new_score = max(0.0, min(10.0, base + boost))
         out.append(
@@ -855,7 +897,10 @@ def apply_priority_boosts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 **p,
                 "base_llm_score": base,
                 "priority_boost": round(boost, 3),
-                "priority_reasons": reasons,
+                "priority_reasons": [label for label, _ in detailed],
+                "priority_reasons_detailed": [
+                    (label, round(mag, 3)) for label, mag in detailed
+                ],
                 "llm_score": round(new_score, 3),
             }
         )

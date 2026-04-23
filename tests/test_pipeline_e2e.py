@@ -465,6 +465,193 @@ def test_content_dedup_legal_suffix_stripped_on_company():
     assert len(out["product_ai"]) == 1
 
 
+# ---------- Per-track (company, title) cap ----------
+#
+# The cap runs BEFORE cross-track dedup and collapses same-track duplicates
+# (e.g. 3 coworkers resharing the same hiring post). Winner selection is
+# by (llm_score desc, source_preference desc), same as content-dedup.
+
+
+def test_per_track_cap_collapses_same_company_title():
+    """Three identical (company, title) posts → cap=1 keeps exactly one."""
+    boosted = {
+        "growth_marketing": [
+            {
+                "source": "linkedin_post", "post_url": "a",
+                "company": "DevcommX", "title": "GTM Engineer",
+                "llm_score": 7.0,
+            },
+            {
+                "source": "linkedin_post", "post_url": "b",
+                "company": "DevcommX", "title": "GTM Engineer",
+                "llm_score": 8.2,   # highest → should win
+            },
+            {
+                "source": "linkedin_post", "post_url": "c",
+                "company": "DevcommX", "title": "GTM Engineer",
+                "llm_score": 7.5,
+            },
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    assert dropped == 2
+    assert len(out["growth_marketing"]) == 1
+    # Highest-score survivor kept
+    assert out["growth_marketing"][0]["post_url"] == "b"
+    assert out["growth_marketing"][0]["llm_score"] == 8.2
+
+
+def test_per_track_cap_source_preference_tiebreaker():
+    """Equal scores → source preference picks the winner.
+    linkedin_post > linkedin_job > naukri (matches content-dedup stage)."""
+    boosted = {
+        "growth_marketing": [
+            {
+                "source": "naukri", "post_url": "n",
+                "company": "Acme", "title": "Growth Manager",
+                "llm_score": 8.0,
+            },
+            {
+                "source": "linkedin_post", "post_url": "lp",
+                "company": "Acme", "title": "Growth Manager",
+                "llm_score": 8.0,
+            },
+            {
+                "source": "linkedin_job", "post_url": "lj",
+                "company": "Acme", "title": "Growth Manager",
+                "llm_score": 8.0,
+            },
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    assert dropped == 2
+    assert out["growth_marketing"][0]["post_url"] == "lp"
+
+
+def test_per_track_cap_respects_cap_above_one():
+    """cap=2 keeps top-2 per cluster — useful if the user wants a bit of
+    variety within the same role."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "x1",
+             "company": "Acme", "title": "Growth Manager", "llm_score": 9.0},
+            {"source": "linkedin_post", "post_url": "x2",
+             "company": "Acme", "title": "Growth Manager", "llm_score": 8.0},
+            {"source": "linkedin_post", "post_url": "x3",
+             "company": "Acme", "title": "Growth Manager", "llm_score": 7.0},
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=2)
+    assert dropped == 1
+    assert len(out["growth_marketing"]) == 2
+    urls = {p["post_url"] for p in out["growth_marketing"]}
+    assert urls == {"x1", "x2"}
+
+
+def test_per_track_cap_disabled_when_cap_zero():
+    """cap=0 is the opt-out path — nothing is collapsed, even exact dupes."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "a",
+             "company": "Acme", "title": "GM", "llm_score": 7.0},
+            {"source": "linkedin_post", "post_url": "b",
+             "company": "Acme", "title": "GM", "llm_score": 7.0},
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=0)
+    assert dropped == 0
+    assert len(out["growth_marketing"]) == 2
+
+
+def test_per_track_cap_preserves_distinct_titles_same_company():
+    """Same company, different role → different cluster → both kept."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "gm",
+             "company": "Acme", "title": "Growth Manager", "llm_score": 8.0},
+            {"source": "linkedin_post", "post_url": "pm",
+             "company": "Acme", "title": "Product Marketing Manager", "llm_score": 7.5},
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    assert dropped == 0
+    assert len(out["growth_marketing"]) == 2
+
+
+def test_per_track_cap_posts_with_no_signature_left_untouched():
+    """Empty company AND empty title → key too broad → skip dedup.
+    Mirrors the content-dedup stage's same-guard."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "a",
+             "company": "", "title": "", "llm_score": 7.0,
+             "author_name": "someone"},
+            {"source": "linkedin_post", "post_url": "b",
+             "company": "", "title": "", "llm_score": 7.2,
+             "author_name": "someone else"},
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    # No signature → both pass through; we'd rather keep two generic posts
+    # than wrongly collapse unrelated leads.
+    assert dropped == 0
+    assert len(out["growth_marketing"]) == 2
+
+
+def test_per_track_cap_normalizes_legal_suffix():
+    """Acme vs Acme Pvt Ltd should land in the same cluster."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "a",
+             "company": "Acme Technologies Pvt Ltd", "title": "Growth Manager",
+             "llm_score": 7.0},
+            {"source": "linkedin_post", "post_url": "b",
+             "company": "Acme", "title": "Growth Manager",
+             "llm_score": 8.0},
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    assert dropped == 1
+    assert out["growth_marketing"][0]["post_url"] == "b"
+
+
+def test_per_track_cap_normalizes_seniority_in_title():
+    """'Senior Growth Manager' and 'Growth Manager' should cluster together
+    (seniority stopwords are stripped, same as _normalize_title_for_dedup)."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "a",
+             "company": "Acme", "title": "Senior Growth Manager",
+             "llm_score": 7.0},
+            {"source": "linkedin_post", "post_url": "b",
+             "company": "Acme", "title": "Growth Manager",
+             "llm_score": 8.0},
+        ]
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    assert dropped == 1
+    assert out["growth_marketing"][0]["post_url"] == "b"
+
+
+def test_per_track_cap_is_per_track_not_cross_track():
+    """Two tracks seeing the same company/title are BOTH kept — the cap is
+    per-track on purpose (cross-track consolidation is content-dedup's job)."""
+    boosted = {
+        "growth_marketing": [
+            {"source": "linkedin_post", "post_url": "a",
+             "company": "Acme", "title": "Growth Manager", "llm_score": 7.0},
+        ],
+        "strategy_consulting": [
+            {"source": "linkedin_post", "post_url": "a",
+             "company": "Acme", "title": "Growth Manager", "llm_score": 7.0},
+        ],
+    }
+    out, dropped = pipeline._per_track_company_title_cap(boosted, cap=1)
+    assert dropped == 0
+    assert len(out["growth_marketing"]) == 1
+    assert len(out["strategy_consulting"]) == 1
+
+
 # ---------- helpers ----------
 
 def _normalize_raw(raw):

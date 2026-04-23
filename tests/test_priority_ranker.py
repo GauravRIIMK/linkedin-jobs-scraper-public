@@ -943,3 +943,140 @@ def test_author_company_parses_pipe_separator(connections_csv):
         )
         == "razorpay"
     )
+
+
+# ---------------------------- Off-archetype penalty ----------------------------
+# The role_filter pipeline stage tags posts with role_filter_verdict == "pass"
+# or "off_archetype" instead of dropping them. Priority ranker applies a
+# penalty on the off_archetype tag so those posts still flow through every
+# stage but need a strong boost stack to clear the final threshold.
+
+def test_off_archetype_penalty_fires_when_tagged():
+    """A post tagged off_archetype should carry a negative priority_boost
+    equal in magnitude to config.PRIORITY_PENALTY_OFF_ARCHETYPE."""
+    post = {
+        "source": "naukri",
+        "llm_score": 7.0,
+        "role_filter_verdict": "off_archetype",
+    }
+    boosted = priority_ranker.apply_priority_boosts([post])
+    assert boosted[0]["priority_boost"] == pytest.approx(
+        -config.PRIORITY_PENALTY_OFF_ARCHETYPE
+    )
+    assert "Off-archetype" in boosted[0]["priority_reasons"]
+
+
+def test_off_archetype_penalty_skipped_when_pass():
+    post = {
+        "source": "naukri",
+        "llm_score": 7.0,
+        "role_filter_verdict": "pass",
+    }
+    boosted = priority_ranker.apply_priority_boosts([post])
+    assert "Off-archetype" not in boosted[0]["priority_reasons"]
+    assert boosted[0]["priority_boost"] == 0.0
+
+
+def test_off_archetype_penalty_skipped_when_tag_missing():
+    """Back-compat: posts without the verdict tag (legacy runs, unit tests
+    that don't go through the soft-filter stage) should behave as if the
+    tag was 'pass' — no penalty."""
+    post = {"source": "naukri", "llm_score": 7.0}
+    boosted = priority_ranker.apply_priority_boosts([post])
+    assert "Off-archetype" not in boosted[0]["priority_reasons"]
+
+
+def test_off_archetype_stackable_with_positive_boosts(tmp_path, monkeypatch):
+    """A strong boost stack (Tier-1 + LinkedIn post) can outweigh the
+    off-archetype penalty — exactly the user-intent trade-off: genuinely
+    high-signal leads still reach the inbox even when off-archetype."""
+    _write_tier1(["Razorpay"])
+    post = {
+        "source": "linkedin_post",
+        "company": "Razorpay",
+        "llm_score": 7.0,
+        "role_filter_verdict": "off_archetype",
+    }
+    boosted = priority_ranker.apply_priority_boosts([post])
+    # +tier1 (1.0) + linkedin_post (0.6) = 1.6; penalty (-1.2) → net +0.4
+    assert boosted[0]["priority_boost"] > 0
+    # Both signals appear in the reasons list so the user sees the trade-off.
+    reasons = boosted[0]["priority_reasons"]
+    assert "Off-archetype" in reasons
+    assert "Tier-1 Indian company" in reasons
+    assert "LinkedIn post" in reasons
+
+
+def test_off_archetype_penalty_clamps_at_zero_floor():
+    """Final score is clamped to [0, 10] — a low-Haiku + off-archetype post
+    should floor at 0, not go negative."""
+    post = {
+        "source": "naukri",
+        "llm_score": 0.5,
+        "role_filter_verdict": "off_archetype",
+    }
+    boosted = priority_ranker.apply_priority_boosts([post])
+    assert boosted[0]["llm_score"] >= 0.0
+    # Base + boost would be 0.5 - 1.2 = -0.7 without the clamp
+    assert boosted[0]["base_llm_score"] == 0.5
+
+
+# ---------------------------- priority_reasons_detailed ----------------------------
+# The detailed shape carries (label, signed_magnitude) tuples so the email
+# chip renderer can show `[India +0.4]` style numeric transparency.
+
+def test_priority_reasons_detailed_populated():
+    post = {"source": "linkedin_post", "llm_score": 7.0}
+    boosted = priority_ranker.apply_priority_boosts([post])
+    detailed = boosted[0]["priority_reasons_detailed"]
+    assert isinstance(detailed, list)
+    # Must be a list of (label, magnitude) tuples, not strings.
+    assert all(isinstance(item, tuple) and len(item) == 2 for item in detailed)
+    # The LinkedIn-post signal should be labeled + carry the configured boost.
+    labels = [label for label, _ in detailed]
+    mags = {label: mag for label, mag in detailed}
+    assert "LinkedIn post" in labels
+    assert mags["LinkedIn post"] == pytest.approx(config.PRIORITY_BOOST_LINKEDIN_POST)
+
+
+def test_priority_reasons_detailed_and_legacy_reasons_aligned():
+    """The legacy priority_reasons (list[str]) must stay in lockstep with
+    priority_reasons_detailed (list[tuple]) — same labels, same order —
+    so consumers reading either field see a consistent view."""
+    post = {"source": "linkedin_post", "llm_score": 7.0}
+    boosted = priority_ranker.apply_priority_boosts([post])[0]
+    detailed_labels = [label for label, _ in boosted["priority_reasons_detailed"]]
+    assert detailed_labels == boosted["priority_reasons"]
+
+
+def test_priority_reasons_detailed_preserves_penalty_sign():
+    """Penalty magnitudes must be stored NEGATIVE in the detailed list
+    (not as absolute values) so renderers show `-1.2` instead of `+1.2`."""
+    post = {
+        "source": "naukri",
+        "llm_score": 7.0,
+        "role_filter_verdict": "off_archetype",
+    }
+    boosted = priority_ranker.apply_priority_boosts([post])[0]
+    detailed = {label: mag for label, mag in boosted["priority_reasons_detailed"]}
+    assert detailed["Off-archetype"] == pytest.approx(
+        -config.PRIORITY_PENALTY_OFF_ARCHETYPE
+    )
+
+
+def test_compute_priority_boost_detailed_direct():
+    """Direct test of the detailed helper — returns (boost, list[tuple])."""
+    post = {"source": "linkedin_post", "llm_score": 7.0}
+    boost, detailed = priority_ranker.compute_priority_boost_detailed(post)
+    assert boost == pytest.approx(config.PRIORITY_BOOST_LINKEDIN_POST)
+    assert detailed == [("LinkedIn post", config.PRIORITY_BOOST_LINKEDIN_POST)]
+
+
+def test_compute_priority_boost_backcompat_returns_labels():
+    """Legacy compute_priority_boost must still return list[str] labels so
+    external callers (and ~30 existing assertions) don't break."""
+    post = {"source": "linkedin_post", "llm_score": 7.0}
+    boost, reasons = priority_ranker.compute_priority_boost(post)
+    assert boost == pytest.approx(config.PRIORITY_BOOST_LINKEDIN_POST)
+    assert reasons == ["LinkedIn post"]
+    assert all(isinstance(r, str) for r in reasons)

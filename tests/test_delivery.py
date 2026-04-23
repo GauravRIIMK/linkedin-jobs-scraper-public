@@ -102,8 +102,131 @@ def test_build_html_renders_priority_badges():
     html = delivery.build_html(matches)
     assert "Tier-1 Indian company" in html
     assert "Remote" in html
-    # Boost should appear next to the score
+    # Score chip now shows `base → final/10` when boost/penalty moved the
+    # score, so the user sees HOW the final score was built.
+    assert "7.0 &rarr; 8.0/10" in html or "7.0 → 8.0/10" in html
+
+
+def test_build_html_score_chip_unboosted_shows_single_number():
+    """When there's no meaningful boost (|delta| < 0.1), the score chip
+    shows the plain `X.X/10` — no arrow, no base score."""
+    matches = {
+        "growth_marketing": [
+            {
+                "post_url": "https://linkedin.com/x",
+                "author_name": "Acme",
+                "llm_score": 8.0,
+                "base_llm_score": 8.0,
+                "priority_boost": 0.0,
+                "priority_reasons": [],
+                "llm_reason": "fit",
+                "jd_text": "hiring",
+            }
+        ]
+    }
+    html = delivery.build_html(matches)
+    assert "8.0/10" in html
+    # No arrow/transition when boost is effectively zero
+    assert "&rarr;" not in html and "→" not in html
+
+
+def test_build_html_score_chip_penalized_shows_drop():
+    """Negative boost also triggers the `base → final` display
+    (e.g. `8.0 → 6.8/10` when off-archetype penalty fires)."""
+    matches = {
+        "growth_marketing": [
+            {
+                "post_url": "https://linkedin.com/x",
+                "author_name": "Acme",
+                "llm_score": 6.8,
+                "base_llm_score": 8.0,
+                "priority_boost": -1.2,
+                "priority_reasons_detailed": [("Off-archetype", -1.2)],
+                "llm_reason": "off archetype",
+                "jd_text": "hiring",
+            }
+        ]
+    }
+    html = delivery.build_html(matches)
+    # The `base → final` transition fires for penalties too
+    assert "8.0 &rarr; 6.8/10" in html or "8.0 → 6.8/10" in html
+
+
+def test_build_html_renders_chip_magnitudes_from_detailed_reasons():
+    """When priority_reasons_detailed is present, each chip gets a `+X.X`
+    or `-X.X` suffix so the user sees the per-signal contribution."""
+    matches = {
+        "growth_marketing": [
+            {
+                "post_url": "https://linkedin.com/x",
+                "author_name": "Acme",
+                "llm_score": 8.0,
+                "base_llm_score": 6.6,
+                "priority_boost": 1.4,
+                "priority_reasons_detailed": [
+                    ("Tier-1 Indian company", 1.0),
+                    ("India", 0.4),
+                ],
+                "llm_reason": "fit",
+                "jd_text": "hiring",
+            }
+        ]
+    }
+    html = delivery.build_html(matches)
+    # Label present
+    assert "Tier-1 Indian company" in html
+    assert "India" in html
+    # Magnitudes appear inside the chips
     assert "+1.0" in html
+    assert "+0.4" in html
+
+
+def test_build_html_renders_off_archetype_chip_with_negative_magnitude():
+    """The off-archetype penalty chip shows its negative magnitude
+    (e.g. `Off-archetype -1.2`) to make the trade-off visible."""
+    matches = {
+        "growth_marketing": [
+            {
+                "post_url": "https://linkedin.com/x",
+                "author_name": "Acme",
+                "llm_score": 7.0,
+                "base_llm_score": 8.2,
+                "priority_boost": -1.2,
+                "priority_reasons_detailed": [("Off-archetype", -1.2)],
+                "llm_reason": "fit",
+                "jd_text": "hiring",
+            }
+        ]
+    }
+    html = delivery.build_html(matches)
+    assert "Off-archetype" in html
+    # Leading minus with exactly one decimal, as produced by _format_magnitude
+    assert "-1.2" in html
+
+
+def test_build_html_legacy_list_str_reasons_still_render_no_magnitude():
+    """Backward-compat: posts rendered from older CSVs only have
+    priority_reasons: list[str] — chips should still show, just without
+    per-signal magnitudes."""
+    matches = {
+        "growth_marketing": [
+            {
+                "post_url": "https://linkedin.com/x",
+                "author_name": "Acme",
+                "llm_score": 8.0,
+                "base_llm_score": 8.0,   # no transition shown
+                "priority_boost": 0.0,
+                "priority_reasons": ["Remote", "LinkedIn post"],
+                "llm_reason": "fit",
+                "jd_text": "hiring",
+            }
+        ]
+    }
+    html = delivery.build_html(matches)
+    assert "Remote" in html
+    assert "LinkedIn post" in html
+    # No `+X.X` noise when the detailed shape isn't supplied
+    assert "+0.0" not in html
 
 
 def test_build_html_contains_post_link_and_form_link():
