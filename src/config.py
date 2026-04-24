@@ -94,6 +94,27 @@ LLM_RERANK_TOP_N = int(os.getenv("LLM_RERANK_TOP_N", "30"))
 # Apply listings every run and the user's explicit priority — LinkedIn
 # posts with recruiter-style hiring language — never reached the LLM.
 LLM_RERANK_MIN_LINKEDIN_POSTS = int(os.getenv("LLM_RERANK_MIN_LINKEDIN_POSTS", "15"))
+# Cap on how many off-archetype posts can occupy rerank top-N slots per track.
+#
+# The role_filter stage uses a SOFT verdict (pass vs off_archetype) and lets
+# every lead flow through. But because similarity alone decides who makes the
+# top-N, an off-archetype post with high lexical overlap (e.g. a "Growth
+# Engineer" JD full of "growth", "GTM", "revenue" tokens) can rank ABOVE a
+# genuine growth-marketing post that reads like a recruiter's chatty post.
+# When pool contamination hits ~10% that's enough to evict every genuine
+# pass-archetype candidate from the top-30 — Haiku then sees only off-
+# archetype posts, correctly scores them low, and the track returns zero
+# matches. Exactly the symptom observed on 2026-04-24 for growth_marketing.
+#
+# Fix: pass-archetype posts fill top-N slots FIRST (in similarity order);
+# off-archetype posts compete for at most LLM_RERANK_MAX_OFF_ARCHETYPE
+# remaining slots. Off-archetype still gets a chance to be analyzed — a
+# handful of genuinely-strong outliers can still stack enough boosts to
+# reach the inbox — but they cannot drown out the on-archetype pool.
+#
+# Set to 0 to disable off-archetype entirely in rerank (hard-filter behavior);
+# raise to dilute the on-archetype priority.
+LLM_RERANK_MAX_OFF_ARCHETYPE = int(os.getenv("LLM_RERANK_MAX_OFF_ARCHETYPE", "5"))
 # Raised 6.5 → 7.0 after observing too many borderline-fit posts reaching
 # inbox via boost-lift alone (e.g. Haiku 5.8 + Tier-1 + India = 7.0 exactly,
 # the post itself still a stretch). Tightening the bar works now that two

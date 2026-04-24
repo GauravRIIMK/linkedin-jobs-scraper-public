@@ -186,6 +186,217 @@ def test_filter_and_rerank_quota_preserves_similarity_order_within_reserve():
     assert [p["jd_text"] for p in ln_slice] == ["high-ln", "mid-ln", "low-ln"]
 
 
+# ---------- archetype partition (role_filter_verdict-aware quota) ----------
+#
+# Regression guard for the 2026-04-24 growth_marketing zero-match bug:
+# 106 off-archetype posts (Growth Engineer / GTM Engineer JDs with heavy
+# "growth"/"GTM"/"revenue" lexical overlap) crowded the top-30 on raw
+# cosine, leaving Haiku with only off-archetype candidates to score.
+#
+# The fix: pass-archetype posts fill slots first, off-archetype competes
+# for at most `max_off_archetype` slots. Soft-filter philosophy preserved
+# — off-archetype still gets a shot, but can't dominate the rerank pool.
+
+
+def test_filter_and_rerank_target_prioritizes_pass_archetype_over_off():
+    """When both archetypes clear similarity, PASS fills top-N first —
+    even if some off-archetype posts have higher raw similarity."""
+    scored = [
+        # 3 off-archetype posts with VERY high similarity (the bug pattern:
+        # Growth Engineer JDs lexically close to growth-marketing resume).
+        *[
+            {
+                "similarity": 0.95 - i * 0.001,
+                "source": "linkedin_job",
+                "role_filter_verdict": "off_archetype",
+                "jd_text": f"off-hi-{i}",
+            }
+            for i in range(3)
+        ],
+        # 5 pass-archetype posts with LOWER similarity.
+        *[
+            {
+                "similarity": 0.70 - i * 0.01,
+                "source": "linkedin_job",
+                "role_filter_verdict": "pass",
+                "jd_text": f"pass-{i}",
+            }
+            for i in range(5)
+        ],
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.6,
+        top_n=5,
+        min_linkedin_posts=0,     # disable source quota to isolate archetype logic
+        max_off_archetype=2,      # allow up to 2 off-archetype
+    )
+    assert len(out) == 5
+    n_pass = sum(1 for p in out if p.get("role_filter_verdict") == "pass")
+    n_off = sum(1 for p in out if p.get("role_filter_verdict") == "off_archetype")
+    # All 5 pass posts fit → they take all 5 slots; off-archetype cap doesn't matter.
+    assert n_pass == 5
+    assert n_off == 0
+
+
+def test_filter_and_rerank_target_caps_off_archetype_at_max():
+    """When pass-archetype fills only part of top-N, off-archetype posts
+    fill the rest — but never more than `max_off_archetype`."""
+    scored = [
+        # 2 pass-archetype posts.
+        {"similarity": 0.85, "source": "linkedin_job",
+         "role_filter_verdict": "pass", "jd_text": "p0"},
+        {"similarity": 0.80, "source": "linkedin_job",
+         "role_filter_verdict": "pass", "jd_text": "p1"},
+        # 10 off-archetype posts high up on similarity.
+        *[
+            {"similarity": 0.90 - i * 0.001, "source": "linkedin_job",
+             "role_filter_verdict": "off_archetype", "jd_text": f"off-{i}"}
+            for i in range(10)
+        ],
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.5,
+        top_n=10,
+        min_linkedin_posts=0,
+        max_off_archetype=3,
+    )
+    # 2 pass fill their slots; off-archetype capped at 3 (even though 8 more
+    # would qualify on similarity). Total: 5 — the remaining 5 slots stay
+    # empty because the cap explicitly prevents dilution with off-archetype.
+    n_pass = sum(1 for p in out if p.get("role_filter_verdict") == "pass")
+    n_off = sum(1 for p in out if p.get("role_filter_verdict") == "off_archetype")
+    assert n_pass == 2
+    assert n_off == 3
+    assert len(out) == 5
+
+
+def test_filter_and_rerank_target_fills_remaining_with_off_if_no_pass():
+    """Zero pass-archetype posts → off-archetype fills up to its cap.
+    A track with 100% off-archetype pool should still get some Haiku
+    scoring (graceful degradation), but capped — don't waste spend
+    scoring wrong-archetype posts past the limit."""
+    scored = [
+        {"similarity": 0.90 - i * 0.001, "source": "linkedin_job",
+         "role_filter_verdict": "off_archetype", "jd_text": f"off-{i}"}
+        for i in range(20)
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.5,
+        top_n=15,
+        min_linkedin_posts=0,
+        max_off_archetype=4,
+    )
+    assert len(out) == 4  # capped, not 15
+    assert all(p["role_filter_verdict"] == "off_archetype" for p in out)
+
+
+def test_filter_and_rerank_target_treats_missing_verdict_as_pass():
+    """Backward compat: posts without a role_filter_verdict key (legacy
+    callers, older test fixtures) must be treated as pass — otherwise
+    flipping soft-filter on would silently break every caller that
+    didn't opt in to the new field."""
+    scored = [
+        # No role_filter_verdict — should count as pass.
+        {"similarity": 0.9, "source": "naukri_job", "jd_text": "legacy-a"},
+        {"similarity": 0.8, "source": "naukri_job", "jd_text": "legacy-b"},
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.5,
+        top_n=5,
+        min_linkedin_posts=0,
+        max_off_archetype=0,  # hard-ban off-archetype
+    )
+    assert len(out) == 2  # Both admitted — neither is off-archetype.
+
+
+def test_filter_and_rerank_target_source_quota_and_archetype_quota_stack():
+    """Both quotas should apply: LinkedIn-post source reservation runs
+    first (honors explicit user guarantee), then archetype partitioning
+    governs the remaining slots. Both promises held simultaneously."""
+    scored = [
+        # 2 LinkedIn posts (one pass, one off) — both should land in reserve.
+        {"similarity": 0.85, "source": "linkedin_post",
+         "role_filter_verdict": "pass", "jd_text": "lp-pass"},
+        {"similarity": 0.80, "source": "linkedin_post",
+         "role_filter_verdict": "off_archetype", "jd_text": "lp-off"},
+        # 4 Naukri pass posts
+        *[
+            {"similarity": 0.75 - i * 0.01, "source": "naukri_job",
+             "role_filter_verdict": "pass", "jd_text": f"nk-pass-{i}"}
+            for i in range(4)
+        ],
+        # 4 Naukri off-archetype posts at high similarity (the bug pattern).
+        *[
+            {"similarity": 0.88 - i * 0.001, "source": "naukri_job",
+             "role_filter_verdict": "off_archetype", "jd_text": f"nk-off-{i}"}
+            for i in range(4)
+        ],
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.5,
+        top_n=8,
+        min_linkedin_posts=2,   # both LinkedIn posts guaranteed, off-archetype included
+        max_off_archetype=1,    # only 1 NON-reserved off-archetype allowed
+    )
+    # Reserved LinkedIn posts: 2 (pass + off) — source quota honored unconditionally
+    reserved_ln = [p for p in out if p["source"] == "linkedin_post"]
+    assert len(reserved_ln) == 2
+    # In the remaining 6 slots: 4 naukri-pass fill first, then 1 off-archetype (capped).
+    # Total = 2 reserved + 4 pass + 1 off = 7.
+    naukri_pass = [p for p in out if p["source"] == "naukri_job"
+                   and p["role_filter_verdict"] == "pass"]
+    naukri_off = [p for p in out if p["source"] == "naukri_job"
+                  and p["role_filter_verdict"] == "off_archetype"]
+    assert len(naukri_pass) == 4
+    assert len(naukri_off) == 1
+
+
+def test_filter_and_rerank_target_max_off_archetype_zero_hard_bans_off():
+    """`max_off_archetype=0` reproduces the old hard-filter behavior —
+    every off-archetype post is excluded from rerank regardless of
+    similarity. Useful escape hatch for debugging or stricter tracks."""
+    scored = [
+        {"similarity": 0.95, "source": "linkedin_job",
+         "role_filter_verdict": "off_archetype", "jd_text": "off-top"},
+        {"similarity": 0.70, "source": "linkedin_job",
+         "role_filter_verdict": "pass", "jd_text": "pass-mid"},
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.5,
+        top_n=5,
+        min_linkedin_posts=0,
+        max_off_archetype=0,
+    )
+    assert len(out) == 1
+    assert out[0]["role_filter_verdict"] == "pass"
+
+
+def test_filter_and_rerank_target_uses_config_default_for_max_off_archetype(monkeypatch):
+    """When `max_off_archetype` isn't passed, the function picks up
+    config.LLM_RERANK_MAX_OFF_ARCHETYPE — ensures a config-only tuning
+    knob actually reaches the function without needing a code change."""
+    monkeypatch.setattr(matcher.config, "LLM_RERANK_MAX_OFF_ARCHETYPE", 2)
+    scored = [
+        {"similarity": 0.80 - i * 0.001, "source": "linkedin_job",
+         "role_filter_verdict": "off_archetype", "jd_text": f"off-{i}"}
+        for i in range(10)
+    ]
+    out = matcher.filter_and_rerank_target(
+        scored,
+        similarity_threshold=0.5,
+        top_n=10,
+        min_linkedin_posts=0,
+        # max_off_archetype NOT passed — should pull from config
+    )
+    assert len(out) == 2  # config knob of 2 enforced
+
+
 # pytest.approx helper
 def pytest_approx(v):
     import pytest

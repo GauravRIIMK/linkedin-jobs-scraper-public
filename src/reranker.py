@@ -56,6 +56,26 @@ _TRACK_HINTS: dict[str, str] = {
         "language-specific developer roles (Python/Java/React/etc). These "
         "require coding depth the candidate does NOT have."
     ),
+    "growth_marketing": (
+        "CANDIDATE ARCHETYPE: growth / lifecycle / product marketer — owns "
+        "brand, content, lifecycle (email/push/SMS), retention, community, "
+        "SEO/content, and product marketing (PMM) charters. Works across "
+        "marketing, creative, and product — does NOT write production code, "
+        "does NOT run paid-media buying as a primary charter, and is NOT a "
+        "GTM/sales engineer.\n"
+        "Score HIGH (7-10): Growth Marketing Manager, Brand Marketing / "
+        "Brand Manager, Product Marketing Manager (PMM), Lifecycle / Retention "
+        "/ CRM Marketing, Content Marketing, Community Manager, SEO / Content "
+        "Strategist, Marketing Lead / Head of Marketing at an early-stage "
+        "consumer / SaaS company.\n"
+        "Score LOW (0-4) regardless of other signals: Growth Engineer, GTM "
+        "Engineer, Revenue Engineer, Marketing Engineer, Performance / Digital "
+        "Marketing roles that are pure paid-ads buying (Google Ads / Meta Ads "
+        "specialist with no lifecycle/brand/content scope), Sales Development "
+        "Representative (SDR/BDR), Account Executive, Sales Manager. These "
+        "roles either require engineering depth the candidate does NOT have "
+        "or sit in the sales org rather than marketing."
+    ),
 }
 
 

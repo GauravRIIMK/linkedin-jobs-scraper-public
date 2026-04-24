@@ -231,38 +231,60 @@ def filter_and_rerank_target(
     similarity_threshold: float | None = None,
     top_n: int | None = None,
     min_linkedin_posts: int | None = None,
+    max_off_archetype: int | None = None,
 ) -> list[dict[str, Any]]:
     """Keep posts above the similarity threshold, cap to top N for LLM rerank.
 
-    Source-aware quota: LinkedIn posts (source=='linkedin_post') get RESERVED
-    slots in the top-N so they can't be crowded out by machine-generated
-    job-board JDs that match the resume summary's JD-speak lexically but
-    carry less recruiter intent.
+    Two layered quotas make sure the top-N represents what the user actually
+    wants, not just the top-N by raw cosine:
 
-    Why: LinkedIn hiring posts are chatty free-form text (hashtags, emojis,
-    first-person voice); Naukri / LinkedIn-Jobs listings are dense, structured
-    JDs. Pure cosine similarity systematically under-scores the former. With
-    raw top-N, a track with hundreds of job-board listings can saturate all
-    30 rerank slots with zero LinkedIn posts — exactly the outcome the user
-    flagged when the final digest was 100% Naukri + Easy-Apply links.
+      (1) Source quota — LinkedIn posts (source=='linkedin_post') get reserved
+          slots so they can't be crowded out by machine-generated job-board
+          JDs that match the resume summary's JD-speak lexically but carry
+          less recruiter intent.
+
+      (2) Archetype quota — pass-archetype posts (role_filter_verdict=='pass')
+          fill remaining slots FIRST; off-archetype posts compete for at most
+          `max_off_archetype` slots. Soft role-filter admits off-archetype
+          leads so boosted-but-genuinely-strong outliers can still surface,
+          but without this cap they crowd the top-N on lexical overlap alone
+          (e.g. "Growth Engineer" JDs full of growth/GTM/revenue tokens
+          ranked above real growth-marketing posts, evicting every genuine
+          candidate — the 2026-04-24 growth_marketing zero-match bug).
+
+    Why source-before-archetype: the source quota is a guarantee the user
+    explicitly asked for ("LinkedIn posts must always get analyzed"). The
+    archetype quota is a safety net against pool contamination. If both
+    pulled from the same pot the guarantee would weaken when the LinkedIn-
+    posts pool happened to be mostly off-archetype on a given day. Layering
+    keeps each promise intact.
 
     Algorithm:
-      1. Keep all posts with similarity >= threshold (these are the
-         "eligible" candidates).
+      1. Keep all posts with similarity >= threshold.
       2. Reserve up to `min_linkedin_posts` slots for the highest-similarity
-         linkedin_post entries (still sorted by similarity within the quota).
-      3. Fill the remaining slots with the highest-similarity posts from any
-         source that weren't already reserved.
-      4. Total output: at most `top_n` posts, with at least `min(min_linkedin_posts, #eligible LinkedIn posts)` of them being LinkedIn posts.
+         linkedin_post entries.
+      3. In the remaining slots, partition by role_filter_verdict:
+         pass-archetype posts fill first (by similarity desc), then up to
+         `max_off_archetype` off-archetype posts fill the rest.
+      4. Total output: at most `top_n` posts.
 
-    Graceful degradation: if no LinkedIn posts clear the similarity threshold,
-    the quota is unfilled and the other slots absorb the full top_n — no
-    empty slots wasted.
+    Graceful degradation:
+      - No LinkedIn posts pass similarity → source quota stays empty, full
+        top_n goes to the archetype-partitioned remainder.
+      - No pass-archetype posts in the remainder → off-archetype posts fill
+        up to their cap; slots beyond the cap stay empty. The track simply
+        gets fewer Haiku calls that day (correct — don't waste spend scoring
+        posts the filter already flagged as wrong-archetype).
+      - Posts with no `role_filter_verdict` key are treated as pass (for
+        backward compat with legacy callers and test fixtures that predate
+        the soft-filter).
     """
     thr = similarity_threshold if similarity_threshold is not None else config.SIMILARITY_THRESHOLD
     top_n = top_n or config.LLM_RERANK_TOP_N
     if min_linkedin_posts is None:
         min_linkedin_posts = config.LLM_RERANK_MIN_LINKEDIN_POSTS
+    if max_off_archetype is None:
+        max_off_archetype = config.LLM_RERANK_MAX_OFF_ARCHETYPE
 
     # Sort defensively: production callers pass already-sorted output from
     # score_posts_for_track, but the quota's correctness (reserving the TOP
@@ -288,4 +310,22 @@ def filter_and_rerank_target(
     # `remaining` inherits desc-similarity order from `above`; no re-sort needed.
 
     slots_left = max(top_n - len(reserved), 0)
-    return reserved + remaining[:slots_left]
+
+    # Archetype partition: pass posts fill first, then off-archetype up to
+    # its cap. Missing verdict → treat as pass (legacy fixtures, backward
+    # compat). The source-reserved LinkedIn posts are NOT re-checked here —
+    # they already earned their slot via the source quota promise, and
+    # applying the archetype cap to them would break that promise.
+    remaining_pass = [
+        p for p in remaining if p.get("role_filter_verdict") != "off_archetype"
+    ]
+    remaining_off = [
+        p for p in remaining if p.get("role_filter_verdict") == "off_archetype"
+    ]
+
+    from_pass = remaining_pass[:slots_left]
+    slots_after_pass = slots_left - len(from_pass)
+    off_cap = max(0, min(slots_after_pass, max_off_archetype))
+    from_off = remaining_off[:off_cap]
+
+    return reserved + from_pass + from_off

@@ -139,7 +139,21 @@ def run_pipeline(dry_run: bool = False) -> dict[str, Any]:
             scored = matcher.score_posts_for_track(track_prefs["resume_summary"], posts)
             top = matcher.filter_and_rerank_target(scored)
             scored_by_track[track] = top
-            _log(log, f"  {track}: {len(scored)} scored · {len(top)} above similarity {config.SIMILARITY_THRESHOLD}")
+            # Archetype split of the top-N headed into Haiku. This number is
+            # the single best early-warning indicator for the 2026-04-24
+            # growth_marketing zero-match pattern: if `pass` drops to zero,
+            # Haiku only sees off-archetype posts and the track will
+            # return 0 matches no matter how well tuned the threshold is.
+            n_pass = sum(
+                1 for p in top if p.get("role_filter_verdict") != "off_archetype"
+            )
+            n_off = len(top) - n_pass
+            _log(
+                log,
+                f"  {track}: {len(scored)} scored · {len(top)} above similarity "
+                f"{config.SIMILARITY_THRESHOLD} "
+                f"(archetype split: {n_pass} pass, {n_off} off-archetype)",
+            )
         except Exception as exc:
             _log(log, f"  {track}: match failed: {exc}")
             scored_by_track[track] = []

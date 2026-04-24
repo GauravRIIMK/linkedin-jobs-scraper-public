@@ -105,3 +105,62 @@ def test_assign_best_track_strips_whitespace():
         client=client,
     )
     assert best == "product_ai"
+
+
+# ---------- Track-specific Haiku guardrails ----------
+#
+# Without a track hint Haiku scores posts in a generic "does JD overlap
+# resume?" mode, which systematically rewards lexical overlap over
+# archetype fit. For growth_marketing that means Growth Engineers / GTM
+# Engineers with heavy "growth"/"revenue" prose score well alongside
+# genuine growth marketers — the 2026-04-24 zero-match bug.
+#
+# These tests lock the hint in place so a refactor can't silently delete
+# it and reintroduce the pathology.
+
+
+def test_rerank_prompt_includes_growth_marketing_hint():
+    """growth_marketing must have a track hint so Haiku knows the archetype."""
+    prompt = reranker._rerank_prompt(
+        "growth_marketing",
+        "resume",
+        "a growth marketing JD",
+        "HR at Acme",
+    )
+    # The formatted block — 'TRACK GUARDRAIL:' with the colon — only
+    # appears when a hint exists for the track.
+    assert "TRACK GUARDRAIL:" in prompt
+    # Positive archetype tokens — we want Haiku to score HIGH on these
+    assert "Brand" in prompt or "brand" in prompt.lower()
+    assert "Lifecycle" in prompt or "lifecycle" in prompt.lower()
+    assert "Product Marketing" in prompt or "PMM" in prompt
+    # Negative archetype tokens — we want Haiku to score LOW on these.
+    # These are the exact roles that contaminated the top-N on 2026-04-24.
+    assert "Growth Engineer" in prompt
+    assert "GTM Engineer" in prompt
+
+
+def test_rerank_prompt_has_hint_for_each_archetype_track():
+    """Every track with an archetype mismatch pattern should have a hint.
+    Currently: ai_ops_automation + growth_marketing. Add more as the
+    pattern emerges for other tracks (e.g. strategy_consulting → 'consultant
+    != consulting manager')."""
+    assert "ai_ops_automation" in reranker._TRACK_HINTS
+    assert "growth_marketing" in reranker._TRACK_HINTS
+
+
+def test_rerank_prompt_omits_guardrail_block_for_tracks_without_hint():
+    """Tracks without a hint must not have a formatted 'TRACK GUARDRAIL:'
+    block with empty content dangling in the prompt — that would confuse
+    Haiku and waste tokens. The instruction text references 'TRACK
+    GUARDRAIL' unconditionally ('archetype fit per the TRACK GUARDRAIL
+    (if any)'), but the block with the actual guardrail content only
+    appears for tracks that have a hint."""
+    prompt = reranker._rerank_prompt(
+        "strategy_consulting",  # no hint defined
+        "resume",
+        "a JD",
+        "HR at Acme",
+    )
+    # The formatted block header — with the colon — must NOT appear.
+    assert "TRACK GUARDRAIL:" not in prompt
